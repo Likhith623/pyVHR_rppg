@@ -1,0 +1,8 @@
+tqdm 
+opencv-python 
+mediapipe
+scipy
+numpy
+matplotlib
+streamlit
+scikit-learn

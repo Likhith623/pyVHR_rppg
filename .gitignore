@@ -1,0 +1,12 @@
+# Ignore ff_downloads folder (Deepfake datasets / large media files)
+ff_downloads/
+FF_DOWNLOADS/
+
+# If you want, also ignore the outputs and virtualenv (uncomment below)
+# Ignore outputs and virtual environment
+outputs/
+neuropulse_env/
+
+# Ignore the project datasets folder
+neuro_pulse/datasets/
+
