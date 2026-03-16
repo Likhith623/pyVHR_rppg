@@ -161,6 +161,19 @@ def extract_roi_green_multi(
 
     avg_roi = float(np.mean(list(roi_values.values())))
     roi_values["combined"] = avg_roi - bg_mean
+    
+    # NEW RESEARCH ADDITION: Red Channel Reference for Anti-Spoofing
+    # Real heartbeats exist in Green channel. Screens/Autofocus pulse in all RGB channels.
+    red_channel = frame[:, :, 2] # BGR index 2 = Red
+    red_means = []
+    for name, indices in roi_map.items():
+        pts = _get_roi_points(face_landmarks, indices, h, w)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, pts, 255)
+        pixels = red_channel[mask == 255]
+        if len(pixels) > 0:
+            red_means.append(float(np.mean(pixels)))
+    roi_values["red_combined"] = float(np.mean(red_means)) if red_means else 0.0
 
     return roi_values
 

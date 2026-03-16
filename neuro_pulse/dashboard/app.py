@@ -4,10 +4,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 """
 Neuro-Pulse Streamlit Dashboard.
 
-Interactive web dashboard for real-time and batch deepfake detection
-using multi-criteria rPPG signal analysis. Displays live webcam feed
-with ROI overlay, BVP waveform, FFT spectrum, multi-criteria confidence
-meter, and liveness verdict.
+Interactive web dashboard for deepfake detection with three modes:
+  1. Live Webcam  — rPPG liveness detection (real face vs photo/screen/mask)
+  2. Analyse Video — ML deepfake classifier (rPPG + visual artifact features)
+  3. Analyse Image — Face detection + static analysis (images lack rPPG data)
 """
 
 import time
@@ -22,7 +22,8 @@ import mediapipe as mp
 
 from src.roi_extractor import extract_roi_green_multi, visualize_roi
 from src.signal_processor import process_signal_buffer
-from src.batch_analyzer import analyze_video
+from src.deepfake_detector import classify_video as ml_classify_video
+from src.media_classifier import classify_media
 
 # ──────────────────────────────────────────────
 # Page Configuration (MUST be first st call)
@@ -34,7 +35,7 @@ st.set_page_config(
 )
 
 # ──────────────────────────────────────────────
-# Session State Initialisation
+# Session State
 # ──────────────────────────────────────────────
 if "running" not in st.session_state:
     st.session_state.running = False
@@ -66,7 +67,7 @@ def render_bvp_waveform(container, green_buffer: list) -> None:
 
 
 def render_fft_spectrum(container, last_result: Optional[Dict]) -> None:
-    if last_result is None:
+    if last_result is None or "freqs" not in last_result:
         container.info("Waiting for FFT data...")
         return
 
@@ -101,27 +102,21 @@ def render_fft_spectrum(container, last_result: Optional[Dict]) -> None:
     plt.close(fig)
 
 
-def render_confidence_meter(last_result: Optional[Dict]) -> None:
+def render_liveness_metrics(last_result: Optional[Dict]) -> None:
+    """Render metrics for webcam liveness mode."""
     if last_result is None:
         st.info("Waiting for analysis...")
         return
 
-    snr = last_result["snr_db"]
     conf = last_result["confidence_pct"]
-    corr = last_result.get("roi_correlation", 0.0)
     pq = last_result.get("peak_quality", 0.0)
-    ss = last_result.get("signal_strength", 0.0)
+    period = last_result.get("periodicity", 0.0)
+    corr = last_result.get("roi_correlation", 0.0)
+    prom = last_result.get("peak_prominence", 0.0)
     verdict = last_result["verdict"]
 
-    if verdict == "SYNTHETIC":
-        color = "#CC2222"
-        level = "FAKE"
-    elif conf < 50:
-        color = "#E6A817"
-        level = "LOW"
-    else:
-        color = "#2D7D4E"
-        level = "HIGH"
+    color = "#2D7D4E" if verdict == "LIVE HUMAN" else "#CC2222"
+    level = "LIVE" if verdict == "LIVE HUMAN" else "FAKE"
 
     st.markdown(f"**Confidence: {conf:.0f}% ({level})**")
     st.progress(min(conf / 100.0, 1.0))
@@ -130,12 +125,44 @@ def render_confidence_meter(last_result: Optional[Dict]) -> None:
         unsafe_allow_html=True,
     )
 
-    # Show all 4 criteria
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("SNR", f"{snr:.1f} dB", delta="Pass" if snr > 3.0 else "Fail")
-    col2.metric("ROI Correlation", f"{corr:.2f}", delta="Pass" if corr > 0.4 else "Fail")
-    col3.metric("Peak Quality", f"{pq:.1f}", delta="Pass" if pq > 2.0 else "Fail")
-    col4.metric("Signal Strength", f"{ss:.2f}", delta="Pass" if ss > 0.15 else "Fail")
+    col1.metric("Peak Quality", f"{pq:.1f}", delta="Pass" if pq > 2.5 else "Fail")
+    col2.metric("Periodicity", f"{period:.3f}", delta="Pass" if period > 0.15 else "Fail")
+    col3.metric("ROI Correlation", f"{corr:.2f}",
+                delta="Pass" if 0.15 < corr < 0.96 else "Fail")
+    col4.metric("Peak Prominence", f"{prom:.2f}", delta="Pass" if prom > 0.5 else "Fail")
+
+
+def render_deepfake_metrics(result: Dict) -> None:
+    """Render metrics for video deepfake detection mode."""
+    conf = result.get("confidence_pct", 0.0)
+    verdict = result.get("verdict", "ERROR")
+    method = result.get("method", "unknown")
+
+    if verdict in ("REAL", "LIVE HUMAN"):
+        color = "#2D7D4E"
+        label = "REAL"
+    elif verdict in ("FAKE", "SYNTHETIC"):
+        color = "#CC2222"
+        label = "FAKE / DEEPFAKE"
+    else:
+        color = "#E6A817"
+        label = "ERROR"
+
+    st.markdown(f"**Verdict: {label} ({conf:.0f}% confidence)** | Method: `{method}`")
+    st.progress(min(conf / 100.0, 1.0))
+    st.markdown(
+        f"<style>div.stProgress > div > div > div {{ background-color: {color}; }}</style>",
+        unsafe_allow_html=True,
+    )
+
+    feats = result.get("features", {})
+    if feats:
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Lap Ratio", f"{feats.get('lap_ratio', 0):.3f}")
+        col2.metric("DCT HF", f"{feats.get('dct_hf', 0):.4f}")
+        col3.metric("Noise Std", f"{feats.get('noise_std', 0):.3f}")
+        col4.metric("Purity Diff", f"{feats.get('gr_purity_diff', 0):.3f}")
 
 
 def render_verdict(last_result: Optional[Dict]) -> None:
@@ -143,13 +170,17 @@ def render_verdict(last_result: Optional[Dict]) -> None:
         st.warning("Awaiting sufficient frames for analysis...")
         return
 
-    verdict = last_result["verdict"]
-    hr = last_result["hr_bpm"]
+    verdict = last_result.get("verdict", "ERROR")
+    hr = last_result.get("hr_bpm", 0.0)
 
     if verdict == "LIVE HUMAN":
         st.success(f"LIVE HUMAN | Heart Rate: {hr:.0f} BPM")
+    elif verdict == "REAL":
+        st.success("REAL VIDEO — No deepfake detected")
+    elif verdict in ("SYNTHETIC", "FAKE"):
+        st.error("DETECTED: Potential Deepfake / Photo / Synthetic Content")
     else:
-        st.error("SYNTHETIC — Potential Deepfake / Photo / Video Detected")
+        st.warning(f"Analysis inconclusive: {verdict}")
 
 
 def render_hr_history(hr_history: list) -> None:
@@ -164,8 +195,10 @@ def render_hr_history(hr_history: list) -> None:
 # Sidebar
 # ──────────────────────────────────────────────
 st.sidebar.title("Neuro-Pulse")
-mode = st.sidebar.radio("Mode", ["Live Webcam", "Analyse Video File"])
-threshold = st.sidebar.slider("SNR Threshold (dB)", 1.0, 6.0, 3.0, 0.1)
+mode = st.sidebar.radio(
+    "Mode",
+    ["Live Webcam", "Analyse Video", "Analyse Image"],
+)
 
 if mode == "Live Webcam":
     start_stop = st.sidebar.button(
@@ -185,9 +218,11 @@ if mode == "Live Webcam":
 # ──────────────────────────────────────────────
 st.title("Neuro-Pulse: rPPG Deepfake Detection")
 
-left_col, right_col = st.columns(2)
-
 if mode == "Live Webcam":
+    st.caption("Liveness detection: Checks for a real heartbeat via rPPG. "
+               "Detects photos, screens, masks, and printed images.")
+
+    left_col, right_col = st.columns(2)
     camera_placeholder = left_col.empty()
     bvp_placeholder = right_col.empty()
     fft_placeholder = right_col.empty()
@@ -257,27 +292,45 @@ if mode == "Live Webcam":
 
             cap.release()
 
-    render_confidence_meter(st.session_state.last_result)
+    render_liveness_metrics(st.session_state.last_result)
     render_verdict(st.session_state.last_result)
 
     if st.session_state.hr_history:
         st.subheader("Heart Rate History")
         render_hr_history(st.session_state.hr_history)
 
-elif mode == "Analyse Video File":
-    uploaded_file = st.file_uploader("Upload a video file", type=["mp4", "mov", "avi"])
+
+elif mode == "Analyse Video":
+    st.caption("Deepfake detection: Analyses rPPG physiological features and "
+               "visual artifacts (Laplacian, DCT, noise patterns) to detect face-swap deepfakes.")
+
+    uploaded_file = st.file_uploader(
+        "Upload a video file",
+        type=["mp4", "mov", "avi", "mkv"],
+    )
 
     if uploaded_file is not None:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             tmp.write(uploaded_file.read())
             tmp_path = tmp.name
 
-        with st.spinner("Analysing video..."):
-            result = analyze_video(tmp_path, snr_threshold=threshold)
+        left_col, right_col = st.columns(2)
 
-        st.session_state.last_result = result
+        # Show a preview frame
+        cap = cv2.VideoCapture(tmp_path)
+        ret, preview_frame = cap.read()
+        if ret:
+            display = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
+            left_col.image(display, channels="RGB", use_column_width=True)
+        cap.release()
 
-        # Read frames for BVP display
+        with st.spinner("Analysing video with ML classifier (rPPG + visual features)..."):
+            result = ml_classify_video(tmp_path)
+
+        render_deepfake_metrics(result)
+        render_verdict(result)
+
+        # Also extract BVP for visualisation
         cap = cv2.VideoCapture(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         green_buffer = []
@@ -291,7 +344,6 @@ elif mode == "Analyse Video File":
             refine_landmarks=False,
         ) as face_mesh:
             count = 0
-            last_frame = None
             while count < 300:
                 ret, frame = cap.read()
                 if not ret:
@@ -307,29 +359,68 @@ elif mode == "Analyse Video File":
                         for key in ["forehead", "left_cheek", "right_cheek"]:
                             roi_buffers_local[key].append(roi_vals[key])
                             last_roi[key] = roi_vals[key]
-                    last_frame = visualize_roi(frame, fl, h, w)
                 count += 1
         cap.release()
 
-        st.session_state.green_buffer = green_buffer
-
-        if last_frame is not None:
-            display = cv2.cvtColor(last_frame, cv2.COLOR_BGR2RGB)
-            left_col.image(display, channels="RGB", use_column_width=True)
-
-        if len(green_buffer) >= 150:
-            full_result = process_signal_buffer(
-                green_buffer, webcam_fps=fps, roi_buffers=roi_buffers_local
-            )
-            if full_result is not None:
-                st.session_state.last_result = full_result
-
-        render_bvp_waveform(right_col, st.session_state.green_buffer)
-        render_fft_spectrum(right_col, st.session_state.last_result)
-        render_confidence_meter(st.session_state.last_result)
-        render_verdict(st.session_state.last_result)
+        if green_buffer:
+            render_bvp_waveform(right_col, green_buffer)
+            if len(green_buffer) >= 150:
+                rppg_result = process_signal_buffer(
+                    green_buffer, webcam_fps=fps, roi_buffers=roi_buffers_local
+                )
+                if rppg_result:
+                    render_fft_spectrum(right_col, rppg_result)
 
         os.unlink(tmp_path)
+
+
+elif mode == "Analyse Image":
+    st.caption("Image analysis: Still images lack temporal rPPG data. "
+               "We check for face presence and report that images cannot be "
+               "verified as live.")
+
+    uploaded_file = st.file_uploader(
+        "Upload an image file",
+        type=["jpg", "jpeg", "png", "bmp", "tiff"],
+    )
+
+    if uploaded_file is not None:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            tmp.write(uploaded_file.read())
+            tmp_path = tmp.name
+
+        left_col, right_col = st.columns(2)
+
+        # Show the image
+        frame = cv2.imread(tmp_path)
+        if frame is not None:
+            display = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            left_col.image(display, channels="RGB", use_column_width=True)
+
+        with st.spinner("Analysing image..."):
+            result = classify_media(tmp_path)
+
+        verdict = result.get("verdict", "ERROR")
+        reason = result.get("reason", "")
+        face_rate = result.get("face_detection_rate", 0.0)
+
+        if verdict == "SYNTHETIC":
+            st.error(f"SYNTHETIC: {reason}")
+        else:
+            st.success(f"Result: {verdict}")
+
+        right_col.markdown("### Analysis Details")
+        right_col.markdown(f"- **Verdict**: {verdict}")
+        right_col.markdown(f"- **Reason**: {reason}")
+        right_col.markdown(f"- **Face detected**: {'Yes' if face_rate > 0 else 'No'}")
+        right_col.info(
+            "Still images cannot contain rPPG (heartbeat) signals. "
+            "Any single image — real or fake — is classified as SYNTHETIC "
+            "because liveness requires temporal video data."
+        )
+
+        os.unlink(tmp_path)
+
 
 # ──────────────────────────────────────────────
 # Footer

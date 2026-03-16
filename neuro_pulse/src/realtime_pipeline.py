@@ -88,8 +88,9 @@ def open_camera(source):
 
 def run_pipeline(source, threshold: float = 3.0) -> None:
     # Per-ROI rolling buffers for correlation analysis
-    MAXLEN = 300  # 10 seconds at 30 FPS
+    MAXLEN = 150  # 5 seconds at 30 FPS
     green_buffer: deque = deque(maxlen=MAXLEN)
+    red_buffer: deque = deque(maxlen=MAXLEN)  # NEW: Red channel for anti-spoofing
     roi_buffers: Dict[str, deque] = {
         "forehead":    deque(maxlen=MAXLEN),
         "left_cheek":  deque(maxlen=MAXLEN),
@@ -116,6 +117,7 @@ def run_pipeline(source, threshold: float = 3.0) -> None:
 
     last_result: Optional[Dict] = None
     frame_count = 0
+    missing_face_frames = 0
     t_start = time.time()
     last_roi: Dict[str, float] = {"forehead": 0.0, "left_cheek": 0.0, "right_cheek": 0.0}
 
@@ -148,27 +150,39 @@ def run_pipeline(source, threshold: float = 3.0) -> None:
                     # Extract per-ROI green values
                     roi_vals = extract_roi_green_multi(frame, face_landmarks, h, w)
 
+                    missing_face_frames = 0
                     if roi_vals is not None:
                         green_buffer.append(roi_vals["combined"])
+                        red_buffer.append(roi_vals.get("red_combined", 0.0))
                         for key in ["forehead", "left_cheek", "right_cheek"]:
                             roi_buffers[key].append(roi_vals[key])
                             last_roi[key] = roi_vals[key]
                     else:
                         # Face found but ROI empty — carry forward
                         green_buffer.append(green_buffer[-1] if green_buffer else 0.0)
+                        red_buffer.append(red_buffer[-1] if red_buffer else 0.0)
                         for key in ["forehead", "left_cheek", "right_cheek"]:
                             roi_buffers[key].append(last_roi[key])
 
                     frame = visualize_roi(frame, face_landmarks, h, w)
                 else:
                     # No face detected
+                    missing_face_frames += 1
                     green_buffer.append(green_buffer[-1] if green_buffer else 0.0)
+                    red_buffer.append(red_buffer[-1] if red_buffer else 0.0)
                     for key in ["forehead", "left_cheek", "right_cheek"]:
                         roi_buffers[key].append(last_roi[key])
                     overlay_text(
                         frame, "No face detected", (10, 30),
                         color=(0, 165, 255)
                     )
+
+                    if missing_face_frames > 15:
+                        green_buffer.clear()
+                        for k in roi_buffers:
+                            roi_buffers[k].clear()
+                        last_result = None
+                        verdict_history.clear()
 
                 # Process signal if we have enough samples
                 if len(green_buffer) >= 150:
@@ -178,6 +192,7 @@ def run_pipeline(source, threshold: float = 3.0) -> None:
                         webcam_fps=fps_actual,
                         roi_buffers=roi_dict,
                         threshold=threshold,
+                        red_buffer=list(red_buffer)
                     )
                     if result is not None:
                         last_result = result
@@ -199,8 +214,12 @@ def run_pipeline(source, threshold: float = 3.0) -> None:
 
                     overlay_text(frame, f"HR: {hr:.0f} BPM", (10, h - 150), color=(255, 255, 255))
                     overlay_text(frame, f"SNR: {snr:.1f} dB", (10, h - 120), color=(255, 255, 255))
-                    overlay_text(frame, f"ROI Corr: {corr:.2f}", (10, h - 90), color=(255, 255, 255))
-                    overlay_text(frame, f"Peak Q: {pq:.1f}", (10, h - 60), color=(255, 255, 255))
+                    
+                    # Display Purity instead of just peak quality
+                    purity = last_result.get("spectral_purity", 0.0)
+                    overlay_text(frame, f"Purity: {purity:.2%}", (10, h - 90), color=(255, 255, 255))
+                    
+                    overlay_text(frame, f"ROI Corr: {corr:.2f}", (10, h - 60), color=(255, 255, 255))
                     overlay_text(frame, f"{verdict} ({conf:.0f}%)", (10, h - 30), color=verdict_color)
                 else:
                     n = len(green_buffer)

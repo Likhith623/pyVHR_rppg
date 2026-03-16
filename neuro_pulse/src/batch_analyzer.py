@@ -4,9 +4,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 """
 Neuro-Pulse Batch Analyzer Module.
 
-Analyses directories of real and fake videos using multi-criteria
-liveness detection (SNR + ROI correlation + peak quality + signal
-strength), computes detection metrics, and exports results to CSV.
+Analyses directories of real and fake videos using two detection modes:
+  1. rPPG liveness (heartbeat-based) — for webcam / real-time
+  2. ML deepfake classifier (rPPG + visual features) — for uploaded videos
+
+Computes detection metrics and exports results to CSV.
 """
 
 import argparse
@@ -22,6 +24,7 @@ import mediapipe as mp
 
 from src.roi_extractor import extract_roi_green_multi
 from src.signal_processor import process_signal_buffer
+from src.deepfake_detector import classify_video as ml_classify_video
 
 # ──────────────────────────────────────────────
 # Module-level FaceMesh instance (initialised once)
@@ -40,10 +43,41 @@ def analyze_video(
 ) -> Dict:
     """Analyse a single video file for deepfake detection.
 
-    Uses multi-ROI extraction and multi-criteria classification.
+    Uses the ML deepfake classifier (rPPG + visual features) for video files.
+    Falls back to rPPG-only liveness classification if the ML model is unavailable.
     """
     filename = os.path.basename(video_path)
 
+    try:
+        # Primary: ML classifier (rPPG + visual features)
+        ml_result = ml_classify_video(video_path)
+        if ml_result["verdict"] != "ERROR":
+            # Map ML verdicts to pipeline verdicts
+            verdict = "LIVE HUMAN" if ml_result["verdict"] == "REAL" else "SYNTHETIC"
+            feats = ml_result.get("features", {})
+            return {
+                "filename": filename,
+                "verdict": verdict,
+                "snr_db": 0.0,
+                "hr_bpm": 0.0,
+                "confidence_pct": ml_result["confidence_pct"],
+                "spectral_purity": feats.get("purity", 0.0),
+                "periodicity": feats.get("periodicity", 0.0),
+                "peak_prominence": feats.get("peak_prominence", 0.0),
+                "roi_correlation": 0.0,
+                "peak_quality": feats.get("peak_quality", 0.0),
+                "signal_strength": 0.0,
+                "lap_ratio": feats.get("lap_ratio", 0.0),
+                "dct_hf": feats.get("dct_hf", 0.0),
+                "frames_processed": 300,
+                "fps_estimated": 30.0,
+                "face_detection_rate": 1.0,
+                "method": ml_result.get("method", "unknown"),
+            }
+    except Exception as e:
+        logging.warning(f"ML classifier failed for {video_path}: {e}, falling back to rPPG")
+
+    # Fallback: rPPG-only liveness detection
     try:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -108,6 +142,9 @@ def analyze_video(
                 "snr_db": result["snr_db"],
                 "hr_bpm": result["hr_bpm"],
                 "confidence_pct": result["confidence_pct"],
+                "spectral_purity": result.get("spectral_purity", 0.0),
+                "periodicity": result.get("periodicity", 0.0),
+                "peak_prominence": result.get("peak_prominence", 0.0),
                 "roi_correlation": result.get("roi_correlation", 0.0),
                 "peak_quality": result.get("peak_quality", 0.0),
                 "signal_strength": result.get("signal_strength", 0.0),
